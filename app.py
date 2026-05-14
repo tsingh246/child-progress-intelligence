@@ -33,11 +33,11 @@ entry_date = st.date_input("Report Date")
 
 source_type = st.selectbox(
     "Source Type",
-    ["aba", "parent", "speech", "ot"]
+    ["aba", "parent", "speech", "ot", "bcba_weekly_note"]
 )
 session_period = st.selectbox(
     "Session Period",
-    ["AM", "PM", "Full Day", "Parent/Home"]
+    ["AM", "PM", "Full Day", "Parent/Home", "Weekly Review"]
 )
 
 therapist_name = st.text_input("Therapist Name")

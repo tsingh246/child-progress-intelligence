@@ -2,13 +2,20 @@ import os
 import json
 import datetime
 import re
+import hashlib
 from collections import Counter
 
 import streamlit as st
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
+from services.ai.ollama_summary import generate_summary_with_ollama
 from services.extraction_service import extract_structured_data
 from services.ocr.ocr_factory import extract_text_from_image
+from services.privacy.deidentification import (
+    collect_placeholder_map,
+    deidentify_text,
+    restore_placeholders,
+)
 
 
 load_dotenv()
@@ -18,10 +25,37 @@ DB_PORT = os.getenv("DB_PORT")
 DB_NAME = os.getenv("DB_NAME")
 DB_USER = os.getenv("DB_USER")
 DB_PASSWORD = os.getenv("DB_PASSWORD")
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+OLLAMA_SUMMARY_MODEL = os.getenv("OLLAMA_SUMMARY_MODEL", "qwen3:4b")
+OLLAMA_VISION_MODEL = os.getenv("OLLAMA_VISION_MODEL", "qwen2.5vl:3b")
+OLLAMA_TIMEOUT_SECONDS = int(os.getenv("OLLAMA_TIMEOUT_SECONDS", "300"))
+OCR_PROVIDER = os.getenv("OCR_PROVIDER", "tesseract")
+AI_SUMMARY_PROVIDER = os.getenv("AI_SUMMARY_PROVIDER", "ollama_local")
+AI_SUMMARY_MODE = os.getenv("AI_SUMMARY_MODE", "fast")
 
 DATABASE_URL = f"postgresql+psycopg2://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 
 engine = create_engine(DATABASE_URL)
+
+
+def ensure_ai_summary_table():
+    with engine.connect() as conn:
+        conn.execute(
+            text("""
+                CREATE TABLE IF NOT EXISTS weekly_ai_summaries (
+                    id SERIAL PRIMARY KEY,
+                    week_start DATE NOT NULL,
+                    week_end DATE NOT NULL,
+                    provider TEXT NOT NULL,
+                    model_name TEXT NOT NULL,
+                    input_fingerprint TEXT NOT NULL,
+                    input_snapshot JSONB NOT NULL,
+                    summary_text TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+        )
+        conn.commit()
 
 
 st.set_page_config(
@@ -273,6 +307,75 @@ def get_raw_text_preview(raw_text, search_terms, preview_length=260):
     return f"{prefix}{raw_text_single_line[start_index:end_index]}{suffix}"
 
 
+def find_section_marker(text_lower, session_period, therapist_name):
+    session_patterns = {
+        "AM": [
+            r"\bam\s+therapist\b",
+            r"\bam\s+session\b",
+            r"\bmorning\s+session\b",
+            r"\bam\b",
+        ],
+        "PM": [
+            r"\bpm\s+therapist\b",
+            r"\bpm\s+session\b",
+            r"\bafternoon\s+session\b",
+            r"\bpm\b",
+        ],
+        "Full Day": [
+            r"\bfull\s+day\b",
+            r"\bdaily\s+care\b",
+            r"\broutine\s+report\b",
+            r"\bgeneral\s+report\b",
+        ],
+    }
+
+    candidate_positions = []
+
+    if therapist_name:
+        therapist_index = text_lower.find(therapist_name.lower())
+        if therapist_index != -1:
+            candidate_positions.append(therapist_index)
+
+    for pattern in session_patterns.get(session_period, []):
+        match = re.search(pattern, text_lower)
+        if match:
+            candidate_positions.append(match.start())
+
+    if not candidate_positions:
+        return -1
+
+    return min(candidate_positions)
+
+
+def trim_text_to_session(raw_text, session_period, therapist_name):
+    if not raw_text or session_period not in ["AM", "PM", "Full Day"]:
+        return raw_text, "No session trimming was needed."
+
+    text_lower = raw_text.lower()
+    start_index = find_section_marker(text_lower, session_period, therapist_name)
+
+    if start_index == -1:
+        return raw_text, "No matching section heading or therapist name was found."
+
+    possible_end_indexes = []
+    other_periods = ["AM", "PM", "Full Day"]
+    for other_period in other_periods:
+        if other_period == session_period:
+            continue
+
+        other_index = find_section_marker(text_lower, other_period, "")
+        if other_index != -1 and other_index > start_index:
+            possible_end_indexes.append(other_index)
+
+    end_index = min(possible_end_indexes) if possible_end_indexes else len(raw_text)
+    trimmed_text = raw_text[start_index:end_index].strip()
+
+    if not trimmed_text:
+        return raw_text, "The matching section was detected, but no text could be trimmed."
+
+    return trimmed_text, f"Trimmed OCR text to the {session_period} section."
+
+
 def write_weekly_interpretation(
     total_entries,
     source_counts,
@@ -510,9 +613,196 @@ def build_weekly_report_text(
     return "\n".join(lines)
 
 
+def build_ai_summary_input_preview(
+    selected_start,
+    selected_end,
+    total_entries,
+    source_counts,
+    positives,
+    challenges,
+    communication,
+    contexts,
+    interventions,
+    parent_observations
+):
+    return {
+        "week_start": selected_start.isoformat(),
+        "week_end": selected_end.isoformat(),
+        "entries_included": total_entries,
+        "sources": dict(source_counts),
+        "extracted_signals": {
+            "positive_signs": positives,
+            "challenges": challenges,
+            "contexts_or_triggers": contexts,
+            "communication": communication,
+            "interventions_or_supports": interventions,
+            "parent_observations": parent_observations,
+        },
+        "future_ai_output_sections": [
+            "therapy_session_overview",
+            "positive_signs",
+            "areas_to_watch",
+            "triggers_and_contexts",
+            "communication_supports",
+            "care_and_routine_notes",
+            "parent_friendly_interpretation",
+            "bcba_discussion_points",
+            "source_limitations",
+        ],
+    }
+
+
+def build_ai_input_fingerprint(rows, summary_input, model_name):
+    fingerprint_payload = {
+        "model_name": model_name,
+        "summary_input": summary_input,
+        "entries": [
+            {
+                "source_type": row.source_type,
+                "session_period": row.session_period,
+                "therapist_name": row.therapist_name,
+                "raw_text": row.raw_text,
+                "structured_data": as_dict(row.structured_data),
+            }
+            for row in rows
+        ],
+    }
+
+    fingerprint_text = json.dumps(
+        fingerprint_payload,
+        sort_keys=True,
+        default=str,
+    )
+
+    return hashlib.sha256(fingerprint_text.encode("utf-8")).hexdigest()
+
+
+def get_cached_ai_summary(selected_start, provider, model_name, input_fingerprint):
+    with engine.connect() as conn:
+        result = conn.execute(
+            text("""
+                SELECT summary_text, created_at
+                FROM weekly_ai_summaries
+                WHERE week_start = :week_start
+                AND provider = :provider
+                AND model_name = :model_name
+                AND input_fingerprint = :input_fingerprint
+                ORDER BY created_at DESC
+                LIMIT 1
+            """),
+            {
+                "week_start": selected_start,
+                "provider": provider,
+                "model_name": model_name,
+                "input_fingerprint": input_fingerprint,
+            }
+        )
+        return result.fetchone()
+
+
+def save_ai_summary(
+    selected_start,
+    selected_end,
+    provider,
+    model_name,
+    input_fingerprint,
+    input_snapshot,
+    summary_text
+):
+    with engine.connect() as conn:
+        conn.execute(
+            text("""
+                INSERT INTO weekly_ai_summaries (
+                    week_start,
+                    week_end,
+                    provider,
+                    model_name,
+                    input_fingerprint,
+                    input_snapshot,
+                    summary_text
+                )
+                VALUES (
+                    :week_start,
+                    :week_end,
+                    :provider,
+                    :model_name,
+                    :input_fingerprint,
+                    CAST(:input_snapshot AS JSONB),
+                    :summary_text
+                )
+            """),
+            {
+                "week_start": selected_start,
+                "week_end": selected_end,
+                "provider": provider,
+                "model_name": model_name,
+                "input_fingerprint": input_fingerprint,
+                "input_snapshot": json.dumps(input_snapshot),
+                "summary_text": summary_text,
+            }
+        )
+        conn.commit()
+
+
+def build_ai_summary_prompt(summary_input, deidentified_entry_text):
+    return f"""
+You are helping a parent prepare a weekly child therapy progress summary.
+
+Important rules:
+- Use only the provided weekly entries.
+- Do not make clinical decisions or diagnoses.
+- Separate observed facts from possible discussion points.
+- If information is missing, say it is missing.
+- Keep the tone parent-friendly, balanced, and practical.
+- Preserve placeholders such as [CHILD], [THERAPIST_1], and [LINK] exactly.
+- Return only the summary report.
+- Do not include compliance notes, meta commentary, or analysis of your own answer.
+- Do not say "let me know" or ask follow-up questions.
+- Do not use emojis or checkmarks.
+
+Return a concise summary with these sections:
+1. Weekly Overview
+2. Positive Signs
+3. Areas to Watch
+4. Triggers and Contexts
+5. Communication Supports
+6. Care and Routine Notes
+7. BCBA Discussion Points
+8. Source Limitations
+
+Structured weekly signals:
+{json.dumps(summary_input, indent=2)}
+
+De-identified saved entry text:
+{deidentified_entry_text}
+""".strip()
+
+
+def build_compact_entry_text(raw_texts, max_chars_per_entry=450):
+    compact_entries = []
+
+    for index, raw_text in enumerate(raw_texts, start=1):
+        cleaned_text = " ".join((raw_text or "").split())
+        if len(cleaned_text) > max_chars_per_entry:
+            cleaned_text = cleaned_text[:max_chars_per_entry] + "..."
+
+        compact_entries.append(f"Entry {index}: {cleaned_text}")
+
+    return "\n\n".join(compact_entries)
+
+
+def write_ai_summary_preparation(ai_summary_input):
+    with st.expander("AI summary preparation details", expanded=False):
+        st.write(
+            "This is the structured input used for AI summary generation."
+        )
+        st.json(ai_summary_input)
+
+
 
 
 apply_soft_theme()
+ensure_ai_summary_table()
 
 st.title("Child Progress Intelligence")
 
@@ -541,24 +831,50 @@ with st.sidebar:
 
     source_type = st.selectbox(
         "Source Type",
-        ["parent", "aba", "speech", "ot", "bcba_weekly_note"]
+        ["parent", "aba", "speech", "ot", "bcba_weekly_note"],
+        key="source_type_select"
     )
 
-    default_session_index = 3
-    if source_type == "bcba_weekly_note":
-        default_session_index = 4
+    session_options = ["AM", "PM", "Full Day", "Parent/Home", "Weekly Review"]
+    default_session_by_source = {
+        "parent": "Parent/Home",
+        "aba": "Full Day",
+        "speech": "Full Day",
+        "ot": "Full Day",
+        "bcba_weekly_note": "Weekly Review",
+    }
+
+    if st.session_state.get("last_source_type_for_session") != source_type:
+        st.session_state["session_period_select"] = default_session_by_source[source_type]
+        st.session_state["last_source_type_for_session"] = source_type
 
     session_period = st.selectbox(
         "Session Period",
-        ["AM", "PM", "Full Day", "Parent/Home", "Weekly Review"],
-        index=default_session_index
+        session_options,
+        key="session_period_select"
     )
+
+    current_entry_context = {
+        "source_type": source_type,
+        "session_period": session_period,
+    }
+    previous_entry_context = st.session_state.get("entry_context")
+
+    if previous_entry_context is None:
+        st.session_state["entry_context"] = current_entry_context
+    elif previous_entry_context != current_entry_context:
+        st.session_state["entry_context"] = current_entry_context
+        st.session_state["ocr_text"] = ""
+        st.session_state["raw_entry_text"] = ""
+        st.session_state.pop("pending_raw_entry_text", None)
+        st.session_state.pop("last_upload_signature", None)
+        st.rerun()
 
     therapist_name = st.text_input("Therapist Name (optional)")
 
     if source_type in ["aba", "speech", "ot"]:
-        default_text = st.session_state.get("ocr_text", "")
-        raw_label = "Raw report text or OCR output"
+        default_text = st.session_state.get("ocr_text") or st.session_state.get("raw_entry_text", "")
+        raw_label = "Raw OCR text / manual corrections"
     elif source_type == "bcba_weekly_note":
         default_text = ""
         raw_label = "BCBA weekly note text (optional if you upload a document or share a link)"
@@ -566,18 +882,57 @@ with st.sidebar:
         default_text = ""
         raw_label = "Parent note"
 
-    raw_text = st.text_area(
-        raw_label,
-        value=default_text,
-        height=250
-    )
+    if "raw_entry_text" not in st.session_state:
+        st.session_state["raw_entry_text"] = default_text
+    elif default_text and st.session_state["raw_entry_text"] != default_text:
+        st.session_state["raw_entry_text"] = default_text
+
+    pending_raw_entry_text = st.session_state.pop("pending_raw_entry_text", None)
+    if pending_raw_entry_text is not None:
+        st.session_state["raw_entry_text"] = pending_raw_entry_text
+
+    if source_type in ["aba", "speech", "ot"]:
+        with st.expander("Raw OCR text / corrections", expanded=False):
+            raw_text = st.text_area(
+                raw_label,
+                height=250,
+                key="raw_entry_text"
+            )
+    else:
+        raw_text = st.text_area(
+            raw_label,
+            height=250,
+            key="raw_entry_text"
+        )
+
+    if (
+        source_type in ["aba", "speech", "ot"]
+        and raw_text
+        and session_period in ["AM", "PM", "Full Day"]
+    ):
+        if st.button("Try trim OCR text to selected session"):
+            trimmed_text, trim_message = trim_text_to_session(
+                raw_text,
+                session_period,
+                therapist_name
+            )
+            st.session_state["ocr_text"] = trimmed_text
+            st.session_state["pending_raw_entry_text"] = trimmed_text
+            st.info(trim_message)
+            st.rerun()
 
     document_link = ""
     weekly_note_file = None
 
     if source_type in ["aba", "speech", "ot"]:
-        ocr_provider = "tesseract"
-        st.caption("OCR provider: local Tesseract")
+        ocr_provider = OCR_PROVIDER
+
+        if ocr_provider == "ollama_vision":
+            ollama_vision_model = OLLAMA_VISION_MODEL
+            st.caption("Experimental local vision OCR. It may be slow.")
+        else:
+            ollama_vision_model = ""
+            st.caption("OCR provider: local Tesseract")
 
         uploaded_files = st.file_uploader(
             "Upload report images for OCR",
@@ -593,18 +948,33 @@ with st.sidebar:
                     use_container_width=True
                 )
 
-            combined_text = ""
-            for uploaded_file in uploaded_files:
-                extracted_text = extract_text_from_image(
-                    uploaded_file,
-                    ocr_provider
-                )
+            upload_signature = (
+                source_type,
+                session_period,
+                tuple((uploaded_file.name, uploaded_file.size) for uploaded_file in uploaded_files)
+            )
 
-                combined_text += "\n\n"
-                combined_text += extracted_text
+            if st.session_state.get("last_upload_signature") == upload_signature:
+                st.success("Upload processed")
+            else:
+                combined_text = ""
+                for uploaded_file in uploaded_files:
+                    extracted_text = extract_text_from_image(
+                        uploaded_file,
+                        ocr_provider,
+                        base_url=OLLAMA_BASE_URL,
+                        model_name=ollama_vision_model,
+                        timeout_seconds=OLLAMA_TIMEOUT_SECONDS
+                    )
 
-            st.session_state["ocr_text"] = combined_text
-            st.success("Upload processed")
+                    combined_text += "\n\n"
+                    combined_text += extracted_text
+
+                st.session_state["ocr_text"] = combined_text
+                st.session_state["pending_raw_entry_text"] = combined_text
+                st.session_state["last_upload_signature"] = upload_signature
+                st.success("Upload processed")
+                st.rerun()
 
     elif source_type == "bcba_weekly_note":
         weekly_note_file = st.file_uploader(
@@ -722,6 +1092,12 @@ with st.sidebar:
                             )
                             st.success("Entry restored.")
                         conn.commit()
+
+    ai_provider = AI_SUMMARY_PROVIDER
+    ai_summary_mode = AI_SUMMARY_MODE
+    ollama_model = OLLAMA_SUMMARY_MODEL
+    ollama_base_url = OLLAMA_BASE_URL
+    ollama_timeout_seconds = OLLAMA_TIMEOUT_SECONDS
 
 st.header("Search Observations")
 
@@ -874,21 +1250,27 @@ if week_options:
     selected_end = selected_start + datetime.timedelta(days=6)
     st.write(f"Insights for Week of {selected_start.isoformat()} ({selected_start.isoformat()} through {selected_end.isoformat()})")
 
-    query = text(
-        "SELECT source_type, session_period, therapist_name, structured_data FROM daily_entries "
+    if st.button("Show Weekly Insights"):
+        st.session_state["show_weekly_insights"] = selected_week
+
+    should_show_weekly_insights = st.session_state.get("show_weekly_insights") == selected_week
+
+    if should_show_weekly_insights:
+        query = text(
+        "SELECT source_type, session_period, therapist_name, raw_text, structured_data FROM daily_entries "
         "WHERE entry_date >= :start_date AND entry_date <= :end_date "
         "AND is_active = TRUE"
-    )
-    params = {"start_date": selected_start, "end_date": selected_end}
+        )
+        params = {"start_date": selected_start, "end_date": selected_end}
 
-    with engine.connect() as conn2:
-        result = conn2.execute(query, params)
-        rows = result.fetchall()
+        with engine.connect() as conn2:
+            result = conn2.execute(query, params)
+            rows = result.fetchall()
 
-    if not rows:
-        st.write("No entries this week")
-    else:
-        challenges = []
+        if not rows:
+            st.write("No entries this week")
+        else:
+            challenges = []
         positives = []
         communication = []
         contexts = []
@@ -897,12 +1279,15 @@ if week_options:
         source_counts = Counter()
         session_counts = Counter()
         therapist_names = []
+        raw_texts = []
 
         for row in rows:
             source_counts[row.source_type] += 1
             session_counts[row.session_period] += 1
             if row.therapist_name and row.therapist_name not in therapist_names:
                 therapist_names.append(row.therapist_name)
+            if row.raw_text:
+                raw_texts.append(row.raw_text)
             data = as_dict(row.structured_data)
             if data:
                 challenges.extend(data.get("challenges", []))
@@ -958,6 +1343,100 @@ if week_options:
             contexts,
             interventions
         )
+
+        st.markdown("---")
+        ai_summary_input = build_ai_summary_input_preview(
+            selected_start,
+            selected_end,
+            total_entries,
+            source_counts,
+            positives,
+            challenges,
+            communication,
+            contexts,
+            interventions,
+            parent_observations
+        )
+        write_ai_summary_preparation(ai_summary_input)
+
+        placeholder_map = collect_placeholder_map(raw_texts, therapist_names)
+        if ai_summary_mode.lower().startswith("fast"):
+            combined_entry_text = build_compact_entry_text(raw_texts)
+        else:
+            combined_entry_text = "\n\n--- Entry ---\n\n".join(raw_texts)
+
+        deidentified_entry_text = deidentify_text(combined_entry_text, placeholder_map)
+        ai_provider_name = ai_provider
+        input_fingerprint = build_ai_input_fingerprint(
+            rows,
+            ai_summary_input,
+            ollama_model
+        )
+        cached_ai_summary = get_cached_ai_summary(
+            selected_start,
+            ai_provider_name,
+            ollama_model,
+            input_fingerprint
+        )
+
+        with st.expander("Preview de-identified AI input", expanded=False):
+            st.write("Names and links are replaced before hosted AI use. Ollama is local, but the same preview is used for consistency.")
+            st.text_area(
+                "De-identified text",
+                value=deidentified_entry_text,
+                height=220,
+                key=f"deidentified_ai_input_{selected_start.isoformat()}",
+                disabled=True
+            )
+
+        if cached_ai_summary:
+            st.success(f"Loaded saved AI summary from {cached_ai_summary.created_at}.")
+            st.session_state[f"ai_summary_{selected_start.isoformat()}"] = cached_ai_summary.summary_text
+
+        generate_ai_summary = st.button(
+            "Generate AI Summary",
+            disabled=ai_provider != "ollama_local" or cached_ai_summary is not None
+        )
+
+        if generate_ai_summary:
+            prompt = build_ai_summary_prompt(ai_summary_input, deidentified_entry_text)
+            with st.spinner(f"Generating summary with Ollama model {ollama_model}..."):
+                ai_result = generate_summary_with_ollama(
+                    ollama_base_url,
+                    ollama_model,
+                    prompt,
+                    timeout_seconds=ollama_timeout_seconds
+                )
+
+            if ai_result["ok"]:
+                restored_summary = restore_placeholders(
+                    ai_result["summary_text"],
+                    placeholder_map
+                )
+                st.session_state[f"ai_summary_{selected_start.isoformat()}"] = restored_summary
+                save_ai_summary(
+                    selected_start,
+                    selected_end,
+                    ai_provider_name,
+                    ollama_model,
+                    input_fingerprint,
+                    ai_summary_input,
+                    restored_summary
+                )
+                st.success("AI summary generated and saved locally.")
+            else:
+                st.error(ai_result["error"])
+
+        saved_ai_summary = st.session_state.get(f"ai_summary_{selected_start.isoformat()}")
+        if saved_ai_summary:
+            st.subheader("Generated AI Summary")
+            st.write(saved_ai_summary)
+            st.download_button(
+                "Download AI summary",
+                data=saved_ai_summary,
+                file_name=f"ai_weekly_summary_{selected_start.isoformat()}.txt",
+                mime="text/plain"
+            )
 
         st.markdown("---")
         report_text = build_weekly_report_text(

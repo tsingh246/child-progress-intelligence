@@ -33,8 +33,10 @@ The current MVP supports:
 * Soft parent-friendly Streamlit UI
 * Lightweight banner image for the app header
 * Tesseract OCR for uploaded report images
+* Experimental local Ollama vision OCR option
 * Multiple image uploads for OCR-supported report types
 * Editable raw text before saving
+* Optional OCR text trimming by selected session
 * Rule-based structured extraction
 * Extraction rules stored in PostgreSQL
 * Local observation search across saved notes and reports
@@ -42,6 +44,7 @@ The current MVP supports:
 * Basic weekly insight summaries
 * Parent-friendly weekly interpretation from available entries
 * Downloadable weekly summary report
+* Experimental local Ollama weekly AI summary generation
 * Entry archive and restore flow
 
 Parent notes are the most important input. Report images and clinician notes are optional context.
@@ -145,6 +148,20 @@ Potential future providers:
 
 Cloud OCR or LLM integrations should not be added until explicitly requested.
 
+## Multi-Section Report Handling
+
+Some therapy reports may include a full-day page plus AM and PM therapist sections.
+
+Current workflow:
+
+* Upload the full-day page as `Full Day`.
+* Upload the session page as `AM` or `PM`.
+* Enter the matching therapist name when known.
+* Review the OCR text before saving.
+* Use `Try trim OCR text to selected session` to keep the matching AM, PM, or Full Day section when headings are detected.
+
+The trim helper uses simple text matching against common section labels and the optional therapist name. It is a convenience feature, not a perfect parser. Always review the editable text before saving.
+
 ## AI Summary Direction
 
 The app is being prepared for future AI summaries, but no AI summary provider is connected yet.
@@ -158,6 +175,67 @@ Before adding AI, the app should preserve:
 * weekly summaries based only on available data
 
 Future AI summaries should be grounded in saved entries and should not replace the original source text.
+
+Planned user flow:
+
+```text
+Select week
+    -> App gathers saved entries for that week
+    -> User clicks Generate AI Summary
+    -> AI returns structured summary sections
+    -> Summary is saved locally in PostgreSQL
+    -> User can review and download the summary
+```
+
+Planned output sections:
+
+* therapy session overview
+* positive signs
+* areas to watch
+* triggers and contexts
+* communication supports
+* care and routine notes
+* parent-friendly interpretation
+* BCBA discussion points
+* source limitations
+
+Possible future table:
+
+```sql
+CREATE TABLE weekly_ai_summaries (
+    id SERIAL PRIMARY KEY,
+    week_start DATE NOT NULL,
+    week_end DATE NOT NULL,
+    provider TEXT NOT NULL,
+    model_name TEXT,
+    input_snapshot JSONB NOT NULL,
+    summary_data JSONB NOT NULL,
+    summary_text TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+The current app only shows an AI summary preparation preview. It does not call an AI provider yet.
+
+Experimental local provider:
+
+```env
+AI_SUMMARY_PROVIDER=ollama_local
+AI_SUMMARY_MODE=fast
+OCR_PROVIDER=tesseract
+OLLAMA_BASE_URL=http://localhost:11434
+OLLAMA_SUMMARY_MODEL=qwen3:4b
+OLLAMA_VISION_MODEL=qwen2.5vl:3b
+OLLAMA_TIMEOUT_SECONDS=300
+```
+
+The app can generate a weekly AI summary with Ollama when Ollama is running locally. Hosted Hugging Face and OpenAI provider choices are shown as future options, but they are not connected yet.
+
+The OCR provider can also be switched to `ollama_vision` in `.env` for local vision OCR experiments. This requires a local Ollama vision model and may be slow on laptop hardware.
+
+AI and OCR model choices are configured outside the web UI so the app stays focused on entry, search, weekly review, and reports.
+
+Before sending text to any hosted provider later, the app should de-identify names and links, then restore placeholders locally after the response.
 
 ## Search Direction
 
@@ -198,6 +276,8 @@ Implemented:
 * Soft parent-friendly Streamlit UI
 * Lightweight app banner image
 * Tesseract OCR processing
+* Experimental local Ollama vision OCR option
+* Optional OCR text trimming by selected session
 * Rule-based extraction
 * Multi-file image upload
 * OCR provider abstraction
@@ -206,6 +286,7 @@ Implemented:
 * Basic weekly summaries
 * Parent-friendly weekly interpretation
 * Downloadable weekly summary report
+* Experimental local Ollama weekly AI summary generation
 * BCBA weekly note source type
 * Entry archive and restore controls
 

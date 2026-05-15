@@ -2,69 +2,63 @@
 
 ## Overview
 
-Child Progress Intelligence is a privacy-first local web application designed to help parents and therapists better understand a child’s development over time using therapy reports, parent observations, and contextual signals.
+Child Progress Intelligence is a privacy-first local Streamlit app for helping parents review child therapy progress over time using parent notes, ABA daily reports, and optional future therapy notes.
 
-The goal of the project is not to replace therapists or clinical assessment.
+The app is not a replacement for clinicians or clinical decision-making. Its goal is to help organize observations, surface patterns, and prepare parent-friendly discussion points for therapy teams.
 
-Instead, the system aims to:
+## Core Philosophy
 
-* Combine structured and unstructured observations
-* Detect patterns over time
-* Improve communication between home and therapy environments
-* Generate weekly insights from daily therapy data
-* Capture both challenges and positive developmental signals
-
----
-
-# Core Philosophy
-
-## Track connection, not perfection.
+Track connection, not perfection.
 
 The project focuses on:
 
 * Engagement
 * Communication
 * Context
+* Positive signals
+* Challenges
 * Progress over time
 
-rather than isolated daily events or rigid assessment snapshots.
+Weekly patterns are preferred over reacting to isolated daily events.
 
----
-
-# Current MVP Scope
+## Current MVP Scope
 
 The current MVP supports:
 
 * Local-only usage
-* PostgreSQL local database
+* Local PostgreSQL database
 * Streamlit web UI
-* OCR-based report ingestion
-* Manual parent note entry
+* Parent note entry
+* ABA, Speech, OT, and BCBA weekly note source types
+* Soft parent-friendly Streamlit UI
+* Lightweight banner image for the app header
+* Tesseract OCR for uploaded report images
+* Multiple image uploads for OCR-supported report types
+* Editable raw text before saving
 * Rule-based structured extraction
-* Multiple image uploads
-* Pluggable OCR architecture
+* Extraction rules stored in PostgreSQL
+* Local observation search across saved notes and reports
+* Search expansion using active extraction rules
+* Basic weekly insight summaries
+* Parent-friendly weekly interpretation from available entries
+* Downloadable weekly summary report
+* Entry archive and restore flow
 
----
+Parent notes are the most important input. Report images and clinician notes are optional context.
 
-# Architecture
+## Current Flow
 
 ```text
-Image Upload
-    ↓
-OCR Provider
-    ↓
-Editable Raw Text
-    ↓
-Structured Extraction
-    ↓
-PostgreSQL Storage
-    ↓
-Weekly Insights (Upcoming)
+Parent note or optional report text/images
+    -> OCR, when images are uploaded
+    -> Editable raw text
+    -> Rule-based structured extraction
+    -> PostgreSQL storage
+    -> Local observation search
+    -> Weekly insights
 ```
 
----
-
-# Current Tech Stack
+## Current Tech Stack
 
 | Layer              | Technology    |
 | ------------------ | ------------- |
@@ -72,262 +66,153 @@ Weekly Insights (Upcoming)
 | Database           | PostgreSQL    |
 | OCR                | Tesseract OCR |
 | Language           | Python        |
-| ORM/DB Access      | SQLAlchemy    |
+| DB Access          | SQLAlchemy    |
 | Environment Config | python-dotenv |
 | Version Control    | Git + GitHub  |
 
----
+## Current Source Types
 
-# Current Features
+* `parent`
+* `aba`
+* `speech`
+* `ot`
+* `bcba_weekly_note`
 
-## 1. Local Privacy-First App
+## Current Session Periods
 
-* All data stored locally
-* No cloud dependency
-* No user accounts
-* No external storage
+* `AM`
+* `PM`
+* `Full Day`
+* `Parent/Home`
+* `Weekly Review`
 
----
+## Database Schema
 
-## 2. OCR Report Processing
+### Table: `daily_entries`
 
-Supports:
+| Column          | Description                                      |
+| --------------- | ------------------------------------------------ |
+| `id`            | Primary key                                      |
+| `entry_date`    | Date of report or note                           |
+| `source_type`   | Entry source, such as parent, ABA, Speech, or OT |
+| `session_period`| AM, PM, Full Day, Parent/Home, or Weekly Review  |
+| `therapist_name`| Optional therapist or clinician name             |
+| `raw_text`      | Original OCR/manual text                         |
+| `structured_data` | Extracted JSON data                           |
+| `created_at`    | Timestamp                                        |
+| `is_active`     | True for active entries, false for archived ones |
+| `deleted_at`    | Archive timestamp                                |
 
-* PNG
-* JPG
-* JPEG
+### Table: `extraction_rules`
 
-Multiple images can be uploaded per entry.
+| Column             | Description                      |
+| ------------------ | -------------------------------- |
+| `category`         | challenges / communication / etc |
+| `normalized_value` | Standardized meaning             |
+| `keyword`          | OCR or phrase match              |
+| `active`           | Rule enabled/disabled            |
 
----
-
-## 3. Editable OCR Review
-
-OCR output is shown to the user before saving.
-
-This allows:
-
-* correction of OCR mistakes
-* validation of extracted text
-* higher-quality downstream insights
-
----
-
-## 4. Structured Extraction Engine
-
-The app converts unstructured text into normalized categories.
-
-Example:
-
-```json
-{
-  "challenges": ["aggression"],
-  "contexts": ["peer interaction"],
-  "communication": ["AAC used or mentioned"]
-}
-```
-
----
-
-## 5. Database-Driven Extraction Rules
-
-Extraction keywords are stored in PostgreSQL instead of hardcoded Python.
-
-This allows:
-
-* incremental learning
-* OCR variation handling
-* easier tuning
-* future admin UI support
-
----
-
-# Database Schema (Current)
-
-## Table: daily_entries
-
-| Column          | Description                      |
-| --------------- | -------------------------------- |
-| id              | Primary key                      |
-| entry_date      | Date of report                   |
-| source_type     | aba / parent / speech / ot       |
-| session_period  | AM / PM / Full Day / Parent/Home |
-| therapist_name  | Therapist name                   |
-| raw_text        | Original OCR/manual text         |
-| structured_data | Extracted JSON data              |
-| created_at      | Timestamp                        |
-
----
-
-## Table: extraction_rules
-
-| Column           | Description                      |
-| ---------------- | -------------------------------- |
-| category         | challenges / communication / etc |
-| normalized_value | Standardized meaning             |
-| keyword          | OCR or phrase match              |
-| active           | Rule enabled/disabled            |
-
----
-
-# Current Folder Structure
+## Current Folder Structure
 
 ```text
-child_progress_intelligence/
-│
-├── app.py
-├── requirements.txt
-├── .env
-│
-├── services/
-│   ├── __init__.py
-│   ├── extraction_service.py
-│   │
-│   └── ocr/
-│       ├── __init__.py
-│       ├── ocr_factory.py
-│       ├── tesseract_ocr.py
-│       └── image_preprocessing.py
+child_progress_app/
+|-- app.py
+|-- requirements.txt
+|-- README.md
+|-- assets/
+|   `-- therapy-progress-banner.png
+|-- .env
+|-- services/
+|   |-- extraction_service.py
+|   `-- ocr/
+|       |-- ocr_factory.py
+|       `-- tesseract_ocr.py
 ```
 
----
+## OCR Provider Architecture
 
-# OCR Provider Architecture
+The OCR layer uses a small factory function so additional OCR providers can be added later.
 
-The application supports pluggable OCR providers.
+Current provider:
 
-Current:
+* `tesseract`
 
-* Tesseract OCR
+Potential future providers:
 
-Planned:
-
-* Ollama Vision Models
-* OpenAI Vision
+* Ollama vision
+* OpenAI vision
 * Azure OCR
-* Claude Vision
 
-The OCR layer is isolated using a factory pattern.
+Cloud OCR or LLM integrations should not be added until explicitly requested.
 
----
+## AI Summary Direction
 
-# Future Roadmap
+The app is being prepared for future AI summaries, but no AI summary provider is connected yet.
 
-## Phase 1 — Core Local MVP
+Before adding AI, the app should preserve:
 
-* OCR ingestion
-* Parent notes
-* Structured extraction
-* Weekly summaries
+* original OCR/manual raw text
+* parent-reviewed edited text
+* entry metadata such as date, source type, session period, and therapist
+* structured extraction output
+* weekly summaries based only on available data
 
----
+Future AI summaries should be grounded in saved entries and should not replace the original source text.
 
-## Phase 2 — Better Extraction
+## Search Direction
 
-* OCR preprocessing improvements
-* Fuzzy matching
-* AI-assisted extraction
-* Semantic normalization
+The current search feature is local keyword search, not vector search.
 
----
+It searches active saved entries across:
 
-## Phase 3 — Intelligence Layer
+* raw text
+* source type
+* session period
+* therapist or clinician name
+* structured extraction JSON
 
-* Weekly trend analysis
-* Pattern detection
-* Cross-environment comparison
-* Communication tracking
-* Engagement scoring
+Search terms are also expanded using active `extraction_rules`. For example, a search like `peer aggression` can also match related rule values such as peer contexts or normalized aggression terms when those rules exist.
 
----
+Future semantic search may use `pgvector`, but that is not implemented yet.
 
-## Phase 4 — AI Enhancement
+## Design Principles
 
-* OCR cleanup via local LLM
-* Vision-based document understanding
-* Context-aware insight generation
-* Semantic search using pgvector
+* Parent note is the only required input for a date entry.
+* ABA report images are optional.
+* Speech and OT reports are optional.
+* BCBA weekly notes are optional.
+* Missing optional data should not block analysis.
+* Insights should be generated from available data only.
+* The app should track both positive signals and challenges.
+* The app should support parent-friendly insights and BCBA discussion points.
+* Data should stay local unless the project direction explicitly changes.
 
----
+## Project Status
 
-## Phase 5 — Packaging
-
-* Local installable desktop app
-* Optional hosted version
-* Mobile companion app
-
----
-
-# Design Principles
-
-## Flexible Inputs
-
-Different therapy centers use different forms.
-
-The system should:
-
-* accept messy data
-* normalize concepts
-* avoid rigid schemas
-
----
-
-## Optional Context Signals
-
-Examples:
-
-* screen time
-* sleep
-* illness
-* environmental changes
-
-These are optional observations, not mandatory fields.
-
----
-
-## Weekly Insights > Daily Noise
-
-The system focuses on:
-
-* trends
-* repeated patterns
-* contextual relationships
-
-rather than reacting to isolated daily events.
-
----
-
-# Long-Term Vision
-
-Build a personalized developmental intelligence system that helps:
-
-* parents understand progress
-* therapists identify patterns
-* therapy/home environments align better
-* children receive more context-aware support
-
-without replacing clinical expertise.
-
----
-
-# Project Status
-
-Current Stage:
-
-Early Local MVP Development
+Current stage: early local MVP development.
 
 Implemented:
 
 * Project setup
-* Git integration
 * PostgreSQL integration
-* OCR processing
+* Soft parent-friendly Streamlit UI
+* Lightweight app banner image
+* Tesseract OCR processing
 * Rule-based extraction
-* Multi-file upload
+* Multi-file image upload
 * OCR provider abstraction
+* Local observation search
+* Search expansion from extraction rules
+* Basic weekly summaries
+* Parent-friendly weekly interpretation
+* Downloadable weekly summary report
+* BCBA weekly note source type
+* Entry archive and restore controls
 
-Upcoming:
+Likely next improvements:
 
-* Weekly insight engine
-* Better OCR preprocessing
-* AI-assisted extraction
+* Parent-note-first entry flow polish
+* More detailed weekly insight wording
+* OCR preprocessing
+* Structured AI-summary output design
+* Database migration notes for schema changes
